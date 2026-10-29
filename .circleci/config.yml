@@ -1,0 +1,264 @@
+version: 2.1
+
+# @ankahi.kathayein's Reels (pipeline/src/ytc/reel_host.py). The project's two schedules set `run`: "reels" at 15
+# past every hour, "factory" at 40 past. A third, "news", runs a cycle of the owner's news desk every quarter of an
+# hour, with the keys of the "news-desk" context; "exam", with the same keys, makes the news desk's daily
+# current-affairs bulletin and its Shorts in a few runs each early morning. A fifth, "watchdog", checks Days of Odd's
+# studio every 3 hours, with the keys of the "days-of-odd" context. The Reels' growth desk runs at the end of the
+# factory job every 6 hours; `run: growth` starts it by hand. A push (the copy from the private repo) runs nothing.
+
+parameters:
+  run:
+    type: enum
+    enum: [none, reels, factory, selftest, news, newstest, exam, watchdog, growth]
+    default: none
+  dry:
+    type: boolean
+    default: false
+  force:
+    type: boolean
+    default: false
+
+executors:
+  python:
+    docker:
+      - image: cimg/python:3.12
+    environment:
+      HF_HOME: /home/circleci/.cache/huggingface
+      PYTHONUNBUFFERED: "1"
+  # Node and Chrome's libraries, for the news Shorts' HyperFrames renders.
+  browsers:
+    docker:
+      - image: cimg/python:3.12-browsers
+    environment:
+      HF_HOME: /home/circleci/.cache/huggingface
+      PYTHONUNBUFFERED: "1"
+
+commands:
+  install:
+    steps:
+      - run:
+          name: Note when the job has to be done
+          # The free plan stops a job at one hour; the factory starts no step it can't finish by AK_UNTIL.
+          command: echo "export AK_UNTIL=$(date -u -d '+50 minutes' +%Y-%m-%dT%H:%M:%S+00:00)" >> "$BASH_ENV"
+      - checkout
+      - run: python3 --version > /tmp/python-version
+      - restore_cache:
+          keys:
+            - venv-v1-{{ checksum "/tmp/python-version" }}-{{ checksum "pipeline/uv.lock" }}
+      - run:
+          name: Install
+          working_directory: pipeline
+          command: |
+            python3 -m pip install --quiet "uv>=0.9,<0.10"
+            python3 -m uv sync --frozen
+      - save_cache:
+          key: venv-v1-{{ checksum "/tmp/python-version" }}-{{ checksum "pipeline/uv.lock" }}
+          paths:
+            - pipeline/.venv
+
+jobs:
+  reels:
+    executor: python
+    resource_class: medium
+    # Branches on the parameters themselves: a boolean put in a step's environment didn't reach the shell as "true".
+    steps:
+      - install
+      - when:
+          condition: << pipeline.parameters.dry >>
+          steps:
+            - run:
+                name: Say what a reels run would do, changing nothing
+                working_directory: pipeline
+                no_output_timeout: 50m
+                command: .venv/bin/python -m ytc.reel_host reels --dry
+      - unless:
+          condition: << pipeline.parameters.dry >>
+          steps:
+            - run:
+                name: Judge, book and mirror
+                working_directory: pipeline
+                no_output_timeout: 50m
+                command: .venv/bin/python -m ytc.reel_host reels
+  factory:
+    executor: python
+    resource_class: large
+    steps:
+      - install
+      - when:
+          condition: << pipeline.parameters.force >>
+          steps:
+            - run:
+                name: Make a Reel, even with the calendar full
+                working_directory: pipeline
+                no_output_timeout: 55m
+                command: .venv/bin/python -m ytc.reel_host factory --until "$AK_UNTIL" --force
+      - unless:
+          condition: << pipeline.parameters.force >>
+          steps:
+            - run:
+                name: Make a Reel when the calendar runs short
+                working_directory: pipeline
+                no_output_timeout: 55m
+                command: .venv/bin/python -m ytc.reel_host factory --until "$AK_UNTIL"
+      # The growth desk edits the backlog this job reads, so it runs here, not in a job of its own: CircleCI drops
+      # one of two jobs queued together in a serial group, and a schedule of its own lost the factory a run.
+      - run:
+          name: The growth desk, when its last run is six hours old and the job has the time
+          working_directory: pipeline
+          no_output_timeout: 30m
+          when: always
+          command: .venv/bin/python -m ytc.reel_host growth --due --until "$AK_UNTIL"
+  selftest:
+    executor: python
+    resource_class: medium
+    steps:
+      - install
+      - run:
+          name: Check the keys, the clone, the releases and ffmpeg
+          working_directory: pipeline
+          command: .venv/bin/python -m ytc.reel_host selftest
+  news:
+    executor: browsers
+    resource_class: medium+
+    steps:
+      - install
+      - when:
+          condition: << pipeline.parameters.dry >>
+          steps:
+            - run:
+                name: A news desk cycle that posts nothing and keeps no state
+                working_directory: pipeline
+                no_output_timeout: 55m
+                command: .venv/bin/python -m ytc.reel_host news --dry
+      - unless:
+          condition: << pipeline.parameters.dry >>
+          steps:
+            - run:
+                name: A news desk cycle
+                working_directory: pipeline
+                no_output_timeout: 55m
+                command: .venv/bin/python -m ytc.reel_host news
+  newstest:
+    executor: browsers
+    resource_class: medium+
+    steps:
+      - install
+      - run:
+          name: Render a kept news Short again, with no Gemini call
+          working_directory: pipeline
+          no_output_timeout: 55m
+          command: .venv/bin/python -m ytc.reel_host news --test
+  exam:
+    executor: browsers
+    resource_class: medium+
+    steps:
+      - install
+      - when:
+          condition: << pipeline.parameters.dry >>
+          steps:
+            - run:
+                name: An exam desk run that uploads nothing to YouTube, in a state of its own
+                working_directory: pipeline
+                no_output_timeout: 55m
+                command: .venv/bin/python -m ytc.reel_host exam --dry --until "$AK_UNTIL"
+      - unless:
+          condition: << pipeline.parameters.dry >>
+          steps:
+            - run:
+                name: The exam desk's run
+                working_directory: pipeline
+                no_output_timeout: 55m
+                command: .venv/bin/python -m ytc.reel_host exam --until "$AK_UNTIL"
+  watchdog:
+    executor: python
+    resource_class: small
+    steps:
+      - install
+      - restore_cache:
+          keys:
+            - watchdog-v1-
+      - run:
+          name: Check Days of Odd's studio and tell the owner's phone what's new
+          working_directory: pipeline
+          no_output_timeout: 20m
+          command: .venv/bin/python -m ytc.reel_host watchdog
+      # reel_host.WATCH_OUT: the alerts and the summary already sent, so the next check doesn't send them again.
+      - save_cache:
+          key: watchdog-v1-{{ epoch }}
+          paths:
+            - ~/watchdog
+          when: always
+  growth:
+    executor: python
+    resource_class: small
+    steps:
+      - install
+      - when:
+          condition: << pipeline.parameters.dry >>
+          steps:
+            - run:
+                name: Read the numbers and decide, changing nothing
+                working_directory: pipeline
+                no_output_timeout: 45m
+                command: .venv/bin/python -m ytc.reel_host growth --dry
+      - unless:
+          condition: << pipeline.parameters.dry >>
+          steps:
+            - run:
+                name: Read every post's numbers and steer what gets made
+                working_directory: pipeline
+                no_output_timeout: 45m
+                command: .venv/bin/python -m ytc.reel_host growth
+
+workflows:
+  reels:
+    when:
+      equal: [reels, << pipeline.parameters.run >>]
+    jobs:
+      - reels:
+          serial-group: ytc-pipeline/reels
+  factory:
+    when:
+      equal: [factory, << pipeline.parameters.run >>]
+    jobs:
+      - factory:
+          serial-group: ytc-pipeline/factory
+  selftest:
+    when:
+      equal: [selftest, << pipeline.parameters.run >>]
+    jobs:
+      - selftest
+  news:
+    when:
+      equal: [news, << pipeline.parameters.run >>]
+    jobs:
+      - news:
+          context: news-desk
+          serial-group: ytc-pipeline/news
+  newstest:
+    when:
+      equal: [newstest, << pipeline.parameters.run >>]
+    jobs:
+      - newstest:
+          context: news-desk
+  exam:
+    when:
+      equal: [exam, << pipeline.parameters.run >>]
+    jobs:
+      - exam:
+          context: news-desk
+          serial-group: ytc-pipeline/exam
+  watchdog:
+    when:
+      equal: [watchdog, << pipeline.parameters.run >>]
+    jobs:
+      - watchdog:
+          context: days-of-odd
+          serial-group: ytc-pipeline/watchdog
+  growth:
+    when:
+      equal: [growth, << pipeline.parameters.run >>]
+    jobs:
+      - growth:
+          serial-group: ytc-pipeline/factory
